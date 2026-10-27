@@ -1,4 +1,4 @@
-"""Group 4's greedy strategy with an optimistic projected profile."""
+"""Group 10's greedy strategy with an optimistic projected profile."""
 
 from models.player import (
 	Advertisement,
@@ -14,7 +14,7 @@ from models.player import Player as BasePlayer
 from models.profile import Profile, decrement
 
 
-class Player4(BasePlayer):
+class Player10(BasePlayer):
 	"""Greedy dating decisions, with maximum values projected on monotonic traits."""
 
 	def __init__(self, snapshot: PlayerSnapshot, ctx: GameContext) -> None:
