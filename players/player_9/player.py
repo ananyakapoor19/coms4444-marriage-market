@@ -1,0 +1,610 @@
+"""Group 9: reciprocal search with bounded, personal acceptance thresholds."""
+
+from dataclasses import dataclass, field
+from math import ceil, sqrt
+from random import Random
+
+from models.player import (
+	Advertisement,
+	Candidate,
+	DateContext,
+	DateOutcome,
+	Decision,
+	GameContext,
+	PlayerSnapshot,
+	RoundContext,
+)
+from models.player import Player as BasePlayer
+from models.profile import Profile, decrement
+
+
+@dataclass
+class CommitmentModel:
+	"""Beta-smoothed response rates; these say nothing about true compatibility.
+
+	Separate proposals after our recent invitation from unsolicited proposals.
+	A decision made simultaneously with our first proposal cannot react to it.
+	"""
+
+	repeat_yes: int = 0
+	repeat_no: int = 0
+	proposal_yes: int = 0
+	proposal_no: int = 0
+	invited_yes: int = 0
+	invited_no: int = 0
+
+	def repeat_probability(self, population: 'CommitmentModel | None' = None) -> float:
+		prior = population.repeat_probability() if population is not None else 0.5
+		return (2 * prior + self.repeat_yes) / (2 + self.repeat_yes + self.repeat_no)
+
+	def proposal_probability(
+		self, invited: bool, population: 'CommitmentModel | None' = None
+	) -> float:
+		yes = self.invited_yes if invited else self.proposal_yes
+		no = self.invited_no if invited else self.proposal_no
+		prior = population.proposal_probability(invited) if population is not None else 0.4
+		return (3 * prior + yes) / (3 + yes + no)
+
+	def observe_repeat(self, agreed: bool) -> None:
+		self.repeat_yes += int(agreed)
+		self.repeat_no += int(not agreed)
+
+	def observe_proposal(self, proposed: bool, invited: bool) -> None:
+		if invited:
+			self.invited_yes += int(proposed)
+			self.invited_no += int(not proposed)
+		else:
+			self.proposal_yes += int(proposed)
+			self.proposal_no += int(not proposed)
+
+
+@dataclass
+class Availability:
+	"""Candidate counts exclude reserved repeats; singles counts do not.
+
+	Between observations, forecast availability with a decaying estimate. The
+	forecast is not a claim that particular people married or rejected us.
+	"""
+
+	count: int
+	observed_round: int = 0
+	retention: float = 0.9
+
+	def observe(self, count: int, round_number: int) -> None:
+		if self.observed_round and round_number > self.observed_round:
+			gap = round_number - self.observed_round
+			ratio = (max(1, count) / max(1, self.count)) ** (1 / gap)
+			self.retention = 0.5 * self.retention + 0.5 * min(1.0, ratio)
+		self.count = count
+		self.observed_round = round_number
+
+	def alternatives(self, round_number: int) -> float:
+		age = max(0, round_number - self.observed_round)
+		forecast = self.count * min(0.95, self.retention) ** age
+		return max(0.0, forecast - 1)  # Exclude the person on our current date.
+
+
+@dataclass(frozen=True)
+class Estimate:
+	"""Scenario estimates, not calibrated probabilities or verified happiness."""
+
+	positive: float
+	mutual_positive: float
+	mean_happiness: float
+	reported_happiness: float | None = None
+
+
+@dataclass
+class PartnerHistory:
+	"""Bounded report memory plus observable courtship outcomes."""
+
+	profiles: list[Profile] = field(default_factory=list)
+	ideals: list[Profile] = field(default_factory=list)
+	profile_changes: int = 0
+	ideal_changes: int = 0
+	last_profile: Profile | None = None
+	last_ideal: Profile | None = None
+	dates: int = 0
+	commitment: CommitmentModel = field(default_factory=CommitmentModel)
+	last_proposal_round: int = 0
+	last_own_proposal_round: int = 0
+	cooldown_until: int = 0
+	asked_again: bool = False
+	invited: bool = False
+	estimate: Estimate | None = None
+
+
+@dataclass
+class Disclosures:
+	"""Per-partner messages; no state or random streams are shared across people."""
+
+	first_profile: Profile | None = None
+	first_ideal: Profile | None = None
+	first_sent_profile: Profile | None = None
+	first_sent_ideal: Profile | None = None
+	previous_profile: Profile | None = None
+	previous_ideal: Profile | None = None
+	current_profile: Profile | None = None
+	current_ideal: Profile | None = None
+
+
+def maximum_penalty(profile: Profile, ideal: Profile, monotonic: int) -> float:
+	"""Largest own decrement plus half their decrement over every possible date."""
+	mine = sum(
+		want * want if i < monotonic else max(want * want, (10 - want) ** 2)
+		for i, want in enumerate(ideal)
+	)
+	theirs = sum(
+		(10 - have) ** 2 if i < monotonic else max(have * have, (10 - have) ** 2)
+		for i, have in enumerate(profile)
+	)
+	return mine + theirs / 2
+
+
+class CompatibilityModel:
+	"""A fixed private scenario bank and a per-instance advertisement cache."""
+
+	def __init__(
+		self, profile: Profile, ideal: Profile, monotonic: int, bonus: float, rng: Random
+	) -> None:
+		self.profile = profile
+		self.ideal = ideal
+		self.monotonic = monotonic
+		self.bonus = bonus
+		self.dims = len(profile)
+		self.ad_estimates: dict[Advertisement, Estimate] = {}
+		# Only our own T and D are genuine population samples. Other people's
+		# selected, potentially deceptive reports do not update this prior.
+		weights = [[1.0] * 11 for _ in range(self.dims)]
+		for dim in range(self.dims):
+			weights[dim][self.profile[dim]] += 1
+			weights[dim][self.ideal[dim]] += 1
+		self.prior_own_costs: list[tuple[int, ...]] = []
+		self.prior_partner_costs: list[tuple[int, ...]] = []
+		for _ in range(64):
+			sampled_profile = tuple(rng.choices(range(11), weights=row)[0] for row in weights)
+			sampled_ideal = tuple(rng.choices(range(11), weights=row)[0] for row in weights)
+			self.prior_own_costs.append(
+				tuple(self.loss(i, self.ideal[i], sampled_profile[i]) for i in range(self.dims))
+			)
+			self.prior_partner_costs.append(
+				tuple(self.loss(i, sampled_ideal[i], self.profile[i]) for i in range(self.dims))
+			)
+		self.prior_totals = [
+			(sum(mine), sum(theirs))
+			for mine, theirs in zip(self.prior_own_costs, self.prior_partner_costs, strict=True)
+		]
+
+		self.private_positive = sum(
+			bonus > own + partner / 2 for own, partner in self.prior_totals
+		) / len(self.prior_totals)
+
+	def loss(self, dim: int, want: int, have: int) -> int:
+		"""Squared mismatch, with no surplus penalty on monotonic dimensions."""
+		gap = want - have
+		return 0 if dim < self.monotonic and gap <= 0 else gap * gap
+
+	def _summarize(self, scenarios: list[tuple[int, int, float]]) -> Estimate:
+		positive = mutual = mean = 0.0
+		for mine, theirs, weight in scenarios:
+			ours = self.bonus - mine - theirs / 2
+			theirs_happiness = self.bonus - theirs - mine / 2
+			positive += weight * (ours > 0)
+			mutual += weight * (ours > 0 and theirs_happiness > 0)
+			mean += weight * ours
+		return Estimate(min(1.0, positive), min(1.0, mutual), mean)
+
+	def ad_estimate(self, ad: Advertisement) -> Estimate:
+		"""Ads weakly condition the prior; unadvertised dimensions remain unknown."""
+		if ad not in self.ad_estimates:
+			mine_ad = self.loss(ad.own_dim, self.ideal[ad.own_dim], ad.own_value)
+			theirs_ad = self.loss(ad.seek_dim, ad.seek_value, self.profile[ad.seek_dim])
+			scenarios = []
+			for k, (mine, theirs) in enumerate(self.prior_totals):
+				# Each advertised half is used in half the scenarios. The four
+				# combinations occur equally often; no advertisement is verified.
+				if k % 2 == 0:
+					mine += mine_ad - self.prior_own_costs[k][ad.own_dim]
+				if k % 4 < 2:
+					theirs += theirs_ad - self.prior_partner_costs[k][ad.seek_dim]
+				scenarios.append((mine, theirs, 1 / len(self.prior_totals)))
+			self.ad_estimates[ad] = self._summarize(scenarios)
+		return self.ad_estimates[ad]
+
+	def date_estimate(self, history: PartnerHistory, ad: Advertisement) -> Estimate:
+		"""Mix plausible reports and latent profiles; never average trait vectors.
+
+		Computing squared losses inside each scenario preserves uncertainty costs.
+		Distinct reports share the report weight, so changing a story does not
+		erase older evidence. The four cases allow either disclosure to be false.
+		"""
+		profile_trust = max(0.4, 0.9 - 0.15 * history.profile_changes)
+		ideal_trust = max(0.4, 0.9 - 0.15 * history.ideal_changes)
+		if any(profile[ad.own_dim] != ad.own_value for profile in history.profiles):
+			profile_trust -= 0.1
+		if any(ideal[ad.seek_dim] != ad.seek_value for ideal in history.ideals):
+			ideal_trust -= 0.1
+		own_reports = [decrement(self.ideal, p, self.monotonic) for p in history.profiles]
+		partner_reports = [decrement(d, self.profile, self.monotonic) for d in history.ideals]
+		scenarios = []
+		count = len(self.prior_totals)
+		for k, (unknown_mine, unknown_theirs) in enumerate(self.prior_totals):
+			mine = own_reports[k % len(own_reports)]
+			theirs = partner_reports[(k // len(own_reports)) % len(partner_reports)]
+			for own_cost, own_weight in ((mine, profile_trust), (unknown_mine, 1 - profile_trust)):
+				for partner_cost, partner_weight in (
+					(theirs, ideal_trust),
+					(unknown_theirs, 1 - ideal_trust),
+				):
+					scenarios.append((own_cost, partner_cost, own_weight * partner_weight / count))
+		estimate = self._summarize(scenarios)
+		reported = (
+			self.bonus
+			- sum(own_reports) / len(own_reports)
+			- sum(partner_reports) / (2 * len(partner_reports))
+		)
+		return Estimate(
+			estimate.positive, estimate.mutual_positive, estimate.mean_happiness, reported
+		)
+
+
+class Player9(BasePlayer):
+	"""Choose promising dates, learn willingness, and adapt to our own prospects.
+
+	The compatibility model uses private traits and uncertain reports. Courtship
+	counts estimate willingness independently. The happiness bar falls as the
+	market disappears and is scaled to 70--144% by private compatibility scarcity.
+	First-date presentation is recoverable under our signaling convention; our
+	decisions always use our real profile and ideal.
+	"""
+
+	def __init__(self, snapshot: PlayerSnapshot, ctx: GameContext) -> None:
+		super().__init__(snapshot, ctx)
+		self.history: dict[int, PartnerHistory] = {}
+		self.disclosures: dict[int, Disclosures] = {}
+		self.opportunities: dict[int, float] = {}
+		self.availability = Availability(self.people - 1)
+		self.available_ids: set[int] = set()
+		self.population_commitment = CommitmentModel()
+		self.last_requests: set[int] = set()
+		self.request_round = 0
+		self.request_trials = 0
+		self.request_hits = 0
+		self.fresh_positive = 0.5
+		self.beliefs = CompatibilityModel(
+			self.profile, self.ideal, self.monotonic, self.bonus, self.rng
+		)
+		self.guaranteed_positive = self.bonus > maximum_penalty(
+			self.profile, self.ideal, self.monotonic
+		)
+
+	def advertise(self) -> Advertisement:
+		"""Show a strength and disclose a preference costly to leave unmet."""
+		showable = range(self.monotonic) if self.monotonic else range(self.dims)
+		own = max(
+			showable,
+			key=lambda i: self.profile[i] if i < self.monotonic else abs(self.profile[i] - 5),
+		)
+		seek = max(
+			range(self.dims),
+			key=lambda i: sum(cost[i] for cost in self.beliefs.prior_own_costs),
+		)
+		return Advertisement(own, self.profile[own], seek, self.ideal[seek])
+
+	def choose_dates(self, candidates: tuple[Candidate, ...], turn: RoundContext) -> list[int]:
+		"""Return an unordered shortlist; ranking controls inclusion only."""
+		self.availability.observe(len(candidates), turn.round)
+		self.available_ids = {candidate.index for candidate in candidates}
+		if self.bonus <= 0:
+			return []
+		ranked = []
+		for candidate in candidates:
+			if turn.rounds_left == 1 and candidate.dates == 0:
+				continue
+			history = self.history.get(candidate.index)
+			estimate = (
+				history.estimate
+				if history and history.estimate
+				else self.beliefs.ad_estimate(candidate.ad)
+			)
+			commitment = self._commitment_chance(
+				history, candidate.dates, turn.rounds_left, turn.round
+			)
+			quality = max(-1.0, min(1.0, estimate.mean_happiness / max(1, self.bonus)))
+			# A preference-driven partner needs a favorable outcome too. Once
+			# presentation is possible, true mutual compatibility is less decisive
+			# for acceptance; our own happiness requirement remains unchanged.
+			weight = 0.35
+			if candidate.dates >= 1:
+				weight = 0.0
+			compatible = (1 - weight) * estimate.positive + weight * estimate.mutual_positive
+			score = compatible * (0.4 + 0.6 * commitment) * (1 + 0.5 * quality)
+			if history and turn.round <= history.cooldown_until and turn.rounds_left > 2:
+				score *= 0.25
+			ranked.append((score, self.rng.random(), candidate))
+		ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+		miss_rate = 1 - self.request_hits / self.request_trials if self.request_trials else 0
+		width = min(len(ranked), max(2, ceil(1.5 * sqrt(len(ranked)) * (1 + 0.5 * miss_rate))))
+		if self.list_limit is not None:
+			width = min(width, self.list_limit)
+		selected = [candidate.index for _, _, candidate in ranked[:width]]
+		self.last_requests = set(selected)
+		self.request_round = turn.round
+		self.request_trials += int(bool(selected))
+		fresh = [
+			self.beliefs.ad_estimate(c.ad).positive
+			for _, _, c in ranked[:width]
+			if c.index not in self.history
+		]
+		if fresh:
+			self.fresh_positive = sum(fresh) / len(fresh)
+		return selected
+
+	def project(self, date: DateContext) -> Profile:
+		"""Enhance the first display reversibly; mirror earlier ideals on repeats."""
+		messages = self._messages(date.partner)
+		if date.date_number >= 2 and messages.first_ideal is not None:
+			claim = messages.first_ideal
+		else:
+			ad = self.advertise()
+			values = list(self.profile)
+			if ad.own_dim < self.monotonic and ad.own_value < 10:
+				for dim in range(self.monotonic):
+					if values[dim] == ad.own_value:
+						values[dim] = 10
+					elif values[dim] == 10:
+						values[dim] = ad.own_value
+			claim = tuple(values)
+		messages.current_profile = claim
+		if messages.first_sent_profile is None:
+			messages.first_sent_profile = claim
+		return claim
+
+	def describe_ideal(self, date: DateContext, observed: Profile) -> Profile:
+		"""Disclose our ideal first; mirror the partner's first profile on repeats."""
+		messages = self._messages(date.partner)
+		claim = (
+			messages.first_profile
+			if date.date_number >= 2 and messages.first_profile is not None
+			else self.ideal
+		)
+		messages.current_ideal = claim
+		if messages.first_sent_ideal is None:
+			messages.first_sent_ideal = claim
+		return claim
+
+	def decide(self, date: DateContext, observed: Profile, stated_ideal: Profile) -> Decision:
+		profile_evidence, ideal_evidence = self._date_evidence(date, observed, stated_ideal)
+		decision = self._assess_date(date, profile_evidence, ideal_evidence)
+		if self.guaranteed_positive:
+			# Preserve ordinary evidence and cooldown updates even when our private
+			# traits prove every possible marriage strictly positive.
+			history = self.history[date.partner]
+			continuation = self._commitment_chance(
+				history, date.date_number, date.rounds_left - 1, date.round + 1
+			)
+			search = self._search_value(date.rounds_left - 1, date.round + 1, date.partner)
+			again = date.rounds_left > 1 and (
+				self.availability.alternatives(date.round) == 0 or continuation >= search
+			)
+			history.asked_again = again
+			propose = date.date_number >= 2
+			if propose:
+				history.last_own_proposal_round = date.round
+			decision = Decision(again=again, propose=propose)
+		messages = self._messages(date.partner)
+		messages.previous_profile = messages.current_profile
+		messages.previous_ideal = messages.current_ideal
+		return decision
+
+	def on_outcome(self, outcome: DateOutcome) -> None:
+		"""Learn willingness after both people have made their decisions."""
+		history = self.history[outcome.partner]
+		model = history.commitment
+		if outcome.date_number >= 2:
+			count = (
+				model.invited_yes + model.invited_no
+				if history.invited
+				else model.proposal_yes + model.proposal_no
+			)
+			if count < 3:
+				self.population_commitment.observe_proposal(
+					outcome.partner_proposed, history.invited
+				)
+			model.observe_proposal(outcome.partner_proposed, history.invited)
+		if outcome.partner_proposed:
+			history.last_proposal_round = outcome.round
+		if outcome.married:
+			return
+		if history.asked_again:
+			# Cap each partner's population contribution so one long courtship
+			# cannot convince us the entire market behaves like that partner.
+			if model.repeat_yes + model.repeat_no < 3:
+				self.population_commitment.observe_repeat(outcome.again)
+			model.observe_repeat(outcome.again)
+
+	def _messages(self, partner: int) -> Disclosures:
+		return self.disclosures.setdefault(partner, Disclosures())
+
+	def _date_evidence(
+		self, date: DateContext, observed: Profile, stated_ideal: Profile
+	) -> tuple[Profile, Profile]:
+		"""Interpret the display convention and keep copied messages as old evidence.
+
+		A coherent advertisement permits the inverse monotonic swap. This is a
+		signaling hypothesis, not verification of the partner's true traits.
+		"""
+		messages = self._messages(date.partner)
+		ad = date.partner_ad
+		if (
+			messages.first_profile is None
+			and ad.own_dim < self.monotonic
+			and ad.own_value < 10
+			and observed[ad.own_dim] == 10
+		):
+			decoded = list(observed)
+			for dim in range(self.monotonic):
+				if decoded[dim] == 10:
+					decoded[dim] = ad.own_value
+				elif decoded[dim] == ad.own_value:
+					decoded[dim] = 10
+			if (
+				decoded[ad.own_dim] == ad.own_value
+				and max(decoded[: self.monotonic]) == ad.own_value
+			):
+				observed = tuple(decoded)
+		if messages.first_profile is None:
+			messages.first_profile, messages.first_ideal = observed, stated_ideal
+		if date.date_number >= 2:
+			if observed in (messages.previous_ideal, messages.first_sent_ideal, self.ideal):
+				observed = messages.first_profile
+			if stated_ideal in (
+				messages.previous_profile,
+				messages.first_sent_profile,
+				self.profile,
+			):
+				stated_ideal = messages.first_ideal
+		return observed, stated_ideal
+
+	def _aspiration(self, rounds_left: int, round_number: int, partner: int) -> float:
+		"""A personal reservation value that relaxes with scarcity and time."""
+		values = sorted(value for index, value in self.opportunities.items() if index != partner)
+		reference = values[int(0.6 * (len(values) - 1))] if values else 0.0
+		threshold = max(0.35 * self.bonus, 0.75 * max(0.0, reference))
+		fraction_left = (rounds_left - 1) / max(1, self.rounds - 1)
+		promising = self.availability.alternatives(round_number) * self.fresh_positive
+		breadth = min(1.0, promising / max(4, sqrt(self.people)))
+		urgency = min(1.0, self.availability.retention / 0.9)
+		bar = 1.3 * (threshold * fraction_left * breadth * urgency)
+		personal = min(1.2, self.beliefs.private_positive / 0.55) ** 2
+		return bar * max(0.7, personal)
+
+	def _commitment_chance(
+		self, history: PartnerHistory | None, dates: int, rounds_left: int, round_number: int
+	) -> float:
+		"""Chance of commitment over at most six dates if we pursue this person.
+
+		Both repeat agreement and a legal, simultaneous proposal are required.
+		The geometric calculation is a decision heuristic, not a calibrated model.
+		"""
+		model = history.commitment if history else CommitmentModel()
+		repeat = model.repeat_probability(self.population_commitment)
+		alive, success = 1.0, 0.0
+		for offset in range(min(6, rounds_left)):
+			if dates + offset + 1 >= 2:
+				recent_invitation = bool(
+					history
+					and history.last_own_proposal_round
+					and round_number + offset - history.last_own_proposal_round <= 2
+				)
+				invited = recent_invitation or dates + offset >= 2
+				proposal = model.proposal_probability(invited, self.population_commitment)
+				if history and history.last_proposal_round:
+					age = round_number + offset - history.last_proposal_round
+					proposal = max(proposal, 0.95 * 0.5 ** max(0, age - 1))
+				success += alive * proposal
+				alive *= 1 - proposal
+			alive *= repeat
+		return min(1.0, success)
+
+	def _search_value(self, rounds_left: int, round_number: int, partner: int) -> float:
+		"""Estimate success probability from fresh and known search alternatives."""
+		alternatives = self.availability.alternatives(round_number)
+		attempts = min(alternatives, max(0, rounds_left) // 2, 3)
+		# Each fresh attempt consumes at least two dates. Do not count a
+		# three-date proposal chance as if it cost only two rounds.
+		new_commitment = self._commitment_chance(None, 0, min(2, rounds_left), round_number)
+		per_attempt = self.fresh_positive * new_commitment
+		value = 1 - (1 - per_attempt) ** attempts
+		age = max(0, round_number - self.availability.observed_round)
+		for candidate in self.available_ids - {partner}:
+			history = self.history.get(candidate)
+			if history and history.estimate and history.estimate.reported_happiness > 0:
+				known = history.estimate.positive * self._commitment_chance(
+					history, history.dates, rounds_left, round_number
+				)
+				value = max(value, known * min(0.95, self.availability.retention) ** age)
+		return value
+
+	def _assess_date(self, date: DateContext, observed: Profile, stated_ideal: Profile) -> Decision:
+		"""Record evidence, then decide whether to repeat, propose, or block."""
+		if date.round == self.request_round and date.partner in self.last_requests:
+			self.request_hits += 1
+		aspiration = self._aspiration(date.rounds_left, date.round, date.partner)
+		history = self.history.setdefault(date.partner, PartnerHistory())
+		history.invited = bool(
+			history.last_own_proposal_round and date.round - history.last_own_proposal_round <= 2
+		)
+		history.profile_changes += int(
+			history.last_profile is not None and history.last_profile != observed
+		)
+		history.ideal_changes += int(
+			history.last_ideal is not None and history.last_ideal != stated_ideal
+		)
+		history.last_profile, history.last_ideal = observed, stated_ideal
+		for reports, report in ((history.profiles, observed), (history.ideals, stated_ideal)):
+			if report not in reports:
+				reports.append(report)
+				del reports[:-4]
+		history.dates += 1
+		estimate = self.beliefs.date_estimate(history, date.partner_ad)
+		history.estimate = estimate
+		if history.dates == 1:
+			self.opportunities[date.partner] = estimate.reported_happiness
+			if len(self.opportunities) > 128:
+				del self.opportunities[next(iter(self.opportunities))]
+
+		# Merely omitting a candidate cannot stop random fallback dates. Block
+		# a strongly unfavorable, uncontradicted report while search time remains.
+		# This is a model-based rejection, not proof of their true incompatibility.
+		if (
+			self.bonus > 0
+			and date.rounds_left > 2
+			and self.availability.alternatives(date.round) > 1
+			and estimate.reported_happiness <= 0
+			and estimate.positive < 0.2
+			and history.profile_changes == 0
+			and history.ideal_changes == 0
+		):
+			history.asked_again = False
+			return Decision(incompatible=True)
+
+		fraction_left = (date.rounds_left - 1) / max(1, self.rounds - 1)
+		available = self.availability.alternatives(date.round)
+		alternatives = min(1.0, available * self.fresh_positive / max(4, sqrt(self.people)))
+		reservation = 0.60 + 0.20 * fraction_left * alternatives
+		ready = estimate.positive >= reservation and estimate.reported_happiness > aspiration
+		if history.last_proposal_round and date.round - history.last_proposal_round <= 2:
+			# Willingness can justify ending the search, but does not establish
+			# compatibility or remove the probability threshold.
+			ready = estimate.positive >= reservation and estimate.reported_happiness > 0
+		if self.bonus > 150 * self.dims:
+			ready = True  # Every possible marriage is strictly positive.
+		if date.rounds_left == 1:
+			# Remove the search threshold, but require favorable dating evidence.
+			# A tiny positive tail from the broad prior alone is not calibrated
+			# evidence for marrying someone whose reports imply a negative score.
+			ready = estimate.reported_happiness > 0
+		propose = bool(self.bonus > 0 and date.date_number >= 2 and ready)
+		# Compare conditional on a repeat being arranged. If they decline,
+		# we can search next turn anyway; asking does not forfeit that option.
+		continuation = estimate.positive * self._commitment_chance(
+			history, date.date_number, date.rounds_left - 1, date.round + 1
+		)
+		search = self._search_value(date.rounds_left - 1, date.round + 1, date.partner)
+		worth_retaining = available == 0 or continuation >= search
+		again = bool(
+			self.bonus > 0
+			and date.rounds_left > 1
+			and estimate.positive >= 0.5
+			and estimate.reported_happiness > 0
+			and (ready or alternatives < 0.5)
+			and worth_retaining
+		)
+		if not again:
+			history.cooldown_until = date.round + 3
+		history.asked_again = again
+		if propose:
+			history.last_own_proposal_round = date.round
+		# Ambiguous reports and stalled courtships receive reversible cooldowns.
+		return Decision(again=again, propose=propose)
