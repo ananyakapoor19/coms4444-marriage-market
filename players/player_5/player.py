@@ -17,7 +17,6 @@ from models.player import (
 	Advertisement,
 	Candidate,
 	DateContext,
-	DateOutcome,
 	Decision,
 	GameContext,
 	PlayerSnapshot,
@@ -27,7 +26,7 @@ from models.player import Player as BasePlayer
 from models.profile import Profile
 
 
-class PlayerTemplate(BasePlayer):
+class Player5(BasePlayer):
 	"""Rename me to Player<k>, where <k> is your group number.
 
 	One instance of this class is one person. Your code may be used for several
@@ -56,6 +55,17 @@ class PlayerTemplate(BasePlayer):
 		# The engine constructs you once, before round 1. Anything you want to
 		# carry between rounds lives on self, so initialise it here.
 		self.history: dict[int, list[Profile]] = {}
+		self.advertisement_tolerance = 1.0
+		self.repeat_tolerance = 3.0
+		self.incompatible_fraction = 0.50
+		self.again_fraction = 0.80
+		self.propose_fraction = 0.80
+		self.proposal_start_tolerance = 1.0
+
+	def _gap(self, dim: int, value: int) -> int:
+		"""Count only shortfalls in monotonic dimensions."""
+		gap = self.ideal[dim] - value
+		return max(0, gap) if dim < self.monotonic else abs(gap)
 
 	def advertise(self) -> Advertisement:
 		"""Called once, before round 1. Fixed for the whole simulation.
@@ -63,8 +73,14 @@ class PlayerTemplate(BasePlayer):
 		Post one of your own characteristics and one characteristic you are
 		looking for. Neither has to be true.
 		"""
+		# If there are no monotonic dimensions, use dimension 0 for both traits.
+		own_dim = max(range(self.monotonic), key=lambda i: self.profile[i]) if self.monotonic else 0
+		seek_dim = min(range(self.monotonic), key=lambda i: self.ideal[i]) if self.monotonic else 0
 		return Advertisement(
-			own_dim=0, own_value=self.profile[0], seek_dim=0, seek_value=self.ideal[0]
+			own_dim=own_dim,
+			own_value=self.profile[own_dim],
+			seek_dim=seek_dim,
+			seek_value=0,
 		)
 
 	def choose_dates(self, candidates: tuple[Candidate, ...], turn: RoundContext) -> list[int]:
@@ -92,7 +108,12 @@ class PlayerTemplate(BasePlayer):
 		Nobody is ever paired with someone either side marked incompatible, so
 		in rare cases you sit a round out.
 		"""
-		return [c.index for c in candidates[: self.list_limit]]
+		chosen = []
+		for candidate in candidates:
+			gap = self._gap(candidate.ad.own_dim, candidate.ad.own_value)
+			if gap <= self.advertisement_tolerance:
+				chosen.append(candidate.index)
+		return chosen[: self.list_limit]
 
 	def project(self, date: DateContext) -> Profile:
 		"""The profile your behaviour projects on this date.
@@ -135,13 +156,19 @@ class PlayerTemplate(BasePlayer):
 		other groups.
 		"""
 		self.history.setdefault(date.partner, []).append(observed)
-		return Decision(again=False, propose=False, incompatible=False)
+		gaps = [self._gap(dim, value) for dim, value in enumerate(observed)]
+		far_dimensions = sum(gap > self.repeat_tolerance for gap in gaps)
+		if far_dimensions / self.dims >= self.incompatible_fraction:
+			return Decision(incompatible=True)
 
-	def on_outcome(self, outcome: DateOutcome) -> None:
-		"""Told what happened after both of you decided.
-
-		outcome.partner_proposed  they proposed to you this round
-		outcome.married           you are now married (to them)
-		outcome.again             you both asked; you meet again next round
-		"""
-		return None
+		# Increase proposal tolerance from 1 to 3 points over the run.
+		progress = (date.round - 1) / max(1, self.rounds - 1)
+		proposal_tolerance = self.proposal_start_tolerance + progress * (
+			self.repeat_tolerance - self.proposal_start_tolerance
+		)
+		close_fraction = (self.dims - far_dimensions) / self.dims
+		proposal_matches = sum(gap <= proposal_tolerance for gap in gaps)
+		return Decision(
+			again=close_fraction >= self.again_fraction,
+			propose=date.date_number >= 2 and proposal_matches / self.dims >= self.propose_fraction,
+		)
