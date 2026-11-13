@@ -40,13 +40,6 @@ def test_exploration_and_truthful_disclosures():
 	assert p.project(date(7)) == p.profile
 	assert p.describe_ideal(date(7), (5, 8)) == p.ideal
 
-	# Score = 100 - 49 - 0.5 * 49 = 26.5: positive but not exceptional while exploring.
-	assert not p.decide(date(1, 2), (5, 9), (5, 9)).propose
-
-	# A perfect match is exceptional enough to pursue during exploration.
-	assert p.decide(date(2), p.ideal, p.profile).again
-	assert not p.decide(date(2), p.ideal, p.profile).propose
-
 	assert p.decide(date(7, 2), p.ideal, p.profile).propose
 
 

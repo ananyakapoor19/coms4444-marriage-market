@@ -5,6 +5,7 @@ Drop-in replacement for players/player_6/player.py.
 
 from __future__ import annotations
 
+import bisect
 import math
 from dataclasses import dataclass
 
@@ -46,7 +47,10 @@ class Player6(BasePlayer):
 	# Defaults adopted from the robust_tuning sweep (1000 training markets,
 	# validated on 1000 fresh ones): +2.57 pts positive rate vs the previous
 	# defaults (95% CI +1.88 to +3.25), mean happiness -2.28.
-	EXPLORE_FRACTION = 0.15
+	EXPLORE_FRACTION = 0.0  # no sampling phase: the bar comes from simulated partners
+	DIST_C = 1.0  # accept when fewer than DIST_C better, willing partners are expected
+	DIST_ACCEPT = 0.5  # share of better partners assumed willing and reachable
+	DIST_SAMPLES = 600
 	EARLY_EXCEPTION_RATIO = 0.35
 	PRIOR_STRENGTH = 1.0
 	EARLY_CONFIDENCE = 0.5
@@ -84,6 +88,8 @@ class Player6(BasePlayer):
 		self.ad_desires = [[0] * 11 for _ in range(self.dims)]
 		self.ad_seen: set[int] = set()
 		self._ad: Advertisement | None = None
+		self.scores: list[float] | None = None
+		self.next_fit = 0
 
 	def _gap(self, dim: int, want: int, have: int) -> int:
 		difference = want - have
@@ -186,7 +192,40 @@ class Player6(BasePlayer):
 		scarcity = 1.0 - singles / max(1, self.people)
 		return max(0.0, min(1.0, max(time_used, scarcity)))
 
+	def _fit_scores(self) -> None:
+		"""Simulate partners from what we have learned so far; sort their scores."""
+		cums = {}
+		for desire in (False, True):
+			cums[desire] = []
+			for d in range(self.dims):
+				acc, row = 0.0, []
+				for p in self._pmf(d, desire=desire):
+					acc += p
+					row.append(acc)
+				cums[desire].append(row)
+
+		def draw(desire: bool) -> tuple[int, ...]:
+			cum = cums[desire]
+			return tuple(min(10, bisect.bisect_left(c, self.rng.random() * c[-1])) for c in cum)
+
+		scores = []
+		for _ in range(self.DIST_SAMPLES):
+			them, wish = draw(False), draw(True)
+			mine = decrement(self.ideal, them, self.monotonic)
+			scores.append(self.bonus - mine - decrement(wish, self.profile, self.monotonic) / 2)
+		self.scores = sorted(scores)
+		self.next_fit = max(1, 2 * len(self.partners))  # refit when we have dated twice as many
+
 	def _threshold(self, round_number: int, singles: int) -> float:
+		if self.scores is not None:
+			left = max(1, self.rounds - round_number + 1)
+			chances = max(1.0, min(left, max(1, singles - 1)) * self.DIST_ACCEPT)
+			q = 1.0 - self.DIST_C / chances
+			if q <= 0:
+				return self.END_MARGIN
+			return max(
+				self.END_MARGIN, self.scores[min(len(self.scores) - 1, int(q * len(self.scores)))]
+			)
 		progress = self._progress(round_number, singles)
 		# Reservation softens monotonically toward zero, never negative.
 		# The sample champion is the secretary-problem reference value.
@@ -267,6 +306,9 @@ class Player6(BasePlayer):
 		return self.ideal
 
 	def choose_dates(self, candidates: tuple[Candidate, ...], turn: RoundContext) -> list[int]:
+		self._observe_ads(candidates)
+		if self.scores is None or len(self.partners) >= self.next_fit:
+			self._fit_scores()
 		self.current_round = turn.round
 		self.current_singles = turn.singles
 		self._observe_ads(candidates)
