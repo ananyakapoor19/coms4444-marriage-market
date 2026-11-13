@@ -24,8 +24,15 @@ class Player10(BasePlayer):
 
 		self.samples: list = [self.profile, self.ideal]
 		self.dated: list[int] = []
+		self.singles_left = self.people  # Last reported count, including ourselves.
 
-		self.monotonic_bump = int(self.bonus / 75)
+		# General-purpose settings selected by the parameter sweeps.
+		self.threshold_scale = 0.25
+		self.decay_exponent = 2.0
+		self.decay_by_singles = False  # True: use singles left instead of rounds left.
+		self.monotonic_exaggeration = 2
+		self.exploration_duration = 0.0  # Fraction of rounds spent collecting data.
+		self.fresh_candidate_fraction = 0.5
 
 	def advertise(self) -> Advertisement:
 		# Show off the monotonic dimension we score best on, and ask for the
@@ -38,12 +45,14 @@ class Player10(BasePlayer):
 		)
 
 	def is_collect_data(self, ctx: RoundContext | DateContext):
-		"""We collect data if we are less than half-way through and we haven't seen everyone.
-		So we stop collecting data if we are more than half-way through or we have seen everyone.
-		"""
-		return ctx.rounds_left > ctx.round and len(self.dated) < self.people
+		"""Collect data during the exploration period until we have seen everyone."""
+		return (
+			ctx.round < self.exploration_duration * (ctx.round + ctx.rounds_left)
+			and len(self.dated) < self.people
+		)
 
 	def choose_dates(self, candidates: tuple[Candidate, ...], turn: RoundContext) -> list[int]:
+		self.singles_left = turn.singles
 		self.remaining = [c.index for c in candidates]
 		if self.is_collect_data(turn):
 			# When collecting data, choose everyone we haven't chosen before
@@ -55,7 +64,8 @@ class Player10(BasePlayer):
 				(c for c in candidates if c.index not in self.estimates),
 				key=lambda c: (self._ad_cost(c.ad), c.index),
 			)
-			chosen += [c.index for c in fresh[: max(1, len(fresh) // 2)]]
+			fresh_count = max(1, int(len(fresh) * self.fresh_candidate_fraction))
+			chosen += [c.index for c in fresh[:fresh_count]]
 			return chosen[: self.list_limit]
 
 	def _gap(self, dim: int, want: int, have: int) -> int:
@@ -73,7 +83,7 @@ class Player10(BasePlayer):
 	def project(self, date: DateContext) -> Profile:
 		projected = list(self.profile)
 		for i in range(self.monotonic):
-			projected[i] = min(10, projected[i] + self.monotonic_bump)
+			projected[i] = min(10, projected[i] + self.monotonic_exaggeration)
 		return tuple(projected)
 
 	# def describe_ideal(self, date: DateContext, observed: Profile) -> Profile:
@@ -83,6 +93,7 @@ class Player10(BasePlayer):
 	# 	return tuple(ideal)
 
 	def calculate_estimate(self, their_profile, their_ideal):
+		"""Compute the happiness based on what we want and what they project (we assume they don't lie)"""
 		mine = decrement(self.ideal, their_profile, self.monotonic)
 		theirs = decrement(their_ideal, self.profile, self.monotonic)
 		return self.bonus - mine - theirs / 2
@@ -119,9 +130,13 @@ class Player10(BasePlayer):
 		# remaining_mean = remaining_samples.mean(axis=0)
 		# mean_estimate = self.calculate_estimate(remaining_mean, remaining_mean)
 
-		propose_threshold = float(date.rounds_left) / float(self.rounds) * self.bonus
+		if self.decay_by_singles:
+			# Repeat dates skip choose_dates, so use the last reported singles count.
+			remaining = float(self.singles_left) / float(self.people)
+		else:
+			remaining = float(date.rounds_left) / float(self.rounds)
+		propose_threshold = remaining**self.decay_exponent * self.bonus * self.threshold_scale
 
-		# @TODO: we can potentially do some threshold decay based on number of turns left and/or single people left
 		# propose_threshold = mean_estimate
 		# propose_threshold = 0
 		# if date.partner in self.proposed_to_me:
