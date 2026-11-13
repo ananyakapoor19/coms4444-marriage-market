@@ -1,0 +1,28 @@
+{
+  "seeds": [
+    1,
+    2,
+    3
+  ],
+  "unique_cells": 26840,
+  "total_engine_runs": 80520,
+  "by_slice": {
+    "A_core": 21708,
+    "A_core_micro": 324,
+    "B_scale": 168,
+    "C_exotic": 2880,
+    "D_extreme": 1760
+  },
+  "by_roster": {
+    "equal": 798,
+    "equal+random": 494,
+    "solo+random": 6360,
+    "90random_10group": 3240,
+    "half-half": 14580,
+    "half-half_sample": 1368
+  },
+  "notes": [
+    "equal+random uses board 10/11 & 20/22 as 12/22 (k per group + 2 random).",
+    "Full cell list is generated in-process by build_cells(); optional cells dump via --write-inventory-full."
+  ]
+}
