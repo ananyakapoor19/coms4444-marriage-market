@@ -33,13 +33,13 @@ class StrategyConfig:
     smoothing: float = 0.0
 
     # Observation phase.
-    observe_sqrt: float = 0.5
+    observe_sqrt: float = 0.25
     observe_sample_fraction: float = 0.25
     observe_round_fraction: float = 0.37
     reserve_rounds: int = 2
 
     # Date selection and acceptance.
-    interest_multiple: float = 1.0
+    interest_multiple: float = 0.5
     sample_size: int = 50
     top_quantile: float = 0.8
 
@@ -63,7 +63,7 @@ class StrategyConfig:
 
     # Change 2: lie to new dates while we expect this many options or fewer (0 = never).
     cornered: float = 2.0
-    stepaside_gap: float = 0.1
+    stepaside_gap: float = 1.0  # Disables stepping aside; probability gaps cannot exceed 1.
     endgame: int = 6
     bar_decay: float = 2.0
 
