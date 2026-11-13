@@ -1,0 +1,19 @@
+{
+  "name": "Player 10 evaluation-set coverage and threshold refinement",
+  "bonuses": [10, 50, 100, 150, 500],
+  "rounds": [5, 50, 150, 500],
+  "dims": [1, 2, 5, 8, 10, 24],
+  "monotonic_modes": ["none", "half", "all"],
+  "distributions": ["uniform", "normal", "mixed", "u_shape", "90_low_10_high", "10_low_90_high", "right_skew"],
+  "roster_families": ["all_groups", "all_groups_random", "half_half", "random_heavy", "self_play"],
+  "training_seeds": [12001, 12002, 12003],
+  "validation_seeds": [13001, 13002, 13003, 13004, 13005],
+  "coverage_design_seed": 20261112,
+  "validation_design_seed": 20261113,
+  "refinement_scenarios": 40,
+  "threshold_scales": [0.0, 0.25, 0.5, 0.75],
+  "decay_exponents": [0.5, 1.0, 2.0, 4.0],
+  "timeout": 1.0,
+  "list_multiple": 4.0,
+  "distribution": "mixed"
+}
