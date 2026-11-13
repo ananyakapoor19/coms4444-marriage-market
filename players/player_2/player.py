@@ -41,7 +41,7 @@ class StrategyConfig:
     # Date selection and acceptance.
     interest_multiple: float = 1.0
     sample_size: int = 50
-    top_quantile: float = 0.95
+    top_quantile: float = 0.8
 
     # Soft suspicion penalty.
     change_weight: float = 1.0
@@ -50,7 +50,7 @@ class StrategyConfig:
     similarity_cutoff: float = 0.98
     suspicion_decay: float = 0.8
     suspicion_cap: float = 3.0
-    penalty_per_dimension: float = 2.0
+    penalty_per_dimension: float = 0.0
 
     # Conditional deception.
     deception_enabled: bool = False
@@ -63,6 +63,9 @@ class StrategyConfig:
 
     # Change 2: lie to new dates while we expect this many options or fewer (0 = never).
     cornered: float = 2.0
+    stepaside_gap: float = 0.1
+    endgame: int = 6
+    bar_decay: float = 2.0
 
 
 def similar(a: Profile, b: Profile, cutoff: float) -> bool:
@@ -284,7 +287,7 @@ class Player2(BasePlayer):
             a = decrement(ik, tw, self.monotonic)
             b = decrement(iw, tk, self.monotonic)
             both_happy = self.bonus - a - b / 2 > 0 and self.bonus - b - a / 2 > 0
-            if both_happy and self._p_both(tk, ik) < self.p_me:
+            if both_happy and self._p_both(tk, ik) < self.p_me - self.config.stepaside_gap:
                 return True
         return False
 
@@ -338,6 +341,8 @@ class Player2(BasePlayer):
                 min(rounds_left - 1, self.singles - 1) / horizon,
             ),
         )
+        elapsed = self.rounds - rounds_left
+        gamma = min(gamma, max(0.0, 1 - elapsed / (self.config.bar_decay * max(1, self.people - 1))))
 
         pool = sorted(
             self.sample_scores
@@ -477,9 +482,9 @@ class Player2(BasePlayer):
 
         # Change 2: cornered, so nothing to lose (single and unhappy score the same).
         if c.cornered and date.date_number == 1 and self._my_options() <= c.cornered:
-            for dim in range(self.monotonic):
-                if dim != self.ad.own_dim:  # more is never worse here; never contradict our ad
-                    persona[dim] = 10
+            weak = [dim for dim in range(self.monotonic) if dim != self.ad.own_dim]
+            if weak:
+                persona[min(weak, key=lambda i: (self.profile[i], i))] = 10
             dim = date.partner_ad.seek_dim  # the trait their ad asks for: up to 2 steps closer
             if dim >= self.monotonic and dim != self.ad.own_dim:
                 persona[dim] += max(-2, min(2, date.partner_ad.seek_value - self.profile[dim]))
@@ -589,6 +594,8 @@ class Player2(BasePlayer):
             return Decision(incompatible=True)  # never again, so they stop using our rounds
         if proposed:  # they already asked us, and we are happy: say yes
             return Decision(again=True, propose=date.date_number >= 2)
+        if date.rounds_left <= self.config.endgame:
+            return Decision(again=True, propose=date.date_number >= 2)
 
         if self.observing:
             return Decision()
@@ -602,6 +609,8 @@ class Player2(BasePlayer):
                 propose=date.date_number >= 2,
             )
 
+        if date.date_number == 1 and date.rounds_left > 1:
+            return Decision(again=True)
         return Decision()
 
     def on_outcome(self, outcome: DateOutcome) -> None:
