@@ -65,6 +65,8 @@ class Player1(BasePlayer):
 		self.ads: dict[int, Advertisement] = {}
 		# partner -> (repriced score, lie cost)
 		self.scores: dict[int, tuple[float, float]] = {}
+		# Their estimated happiness, using the same repriced costs.
+		self.partner_scores: dict[int, float] = {}
 		self.blocked: set[int] = set()
 		self.samples: list[float] = []
 		# What typical people look like, from first dates without red flags.
@@ -106,15 +108,16 @@ class Player1(BasePlayer):
 
 		# Dynamically determine the exploration allocation.
 		explore_fraction = self._exploration_fraction(good, bar, turn.rounds_left)
+		limit = len(candidates) if self.list_limit is None else self.list_limit
 
-		explore_slots = min(self.list_limit, int(self.list_limit * explore_fraction + 0.999))
-		repeat_slots = self.list_limit - explore_slots
+		explore_slots = min(limit, int(limit * explore_fraction + 0.999))
+		repeat_slots = limit - explore_slots
 
 		# Allocate slots between known and fresh candidates.
 		chosen = good[:repeat_slots] + [c.index for c in fresh[:explore_slots]]
 
 		# Fill unused slots if either category has too few candidates.
-		remaining = self.list_limit - len(chosen)
+		remaining = limit - len(chosen)
 
 		if remaining > 0:
 			leftovers = good[repeat_slots:] + [c.index for c in fresh[explore_slots:]]
@@ -129,10 +132,10 @@ class Player1(BasePlayer):
 				and self.scores[i][0] > floor
 				and self._eligible(i, relaxed, endgame)
 			]
-			remaining = self.list_limit - len(chosen)
+			remaining = limit - len(chosen)
 			chosen.extend(weaker_known[:remaining])
 
-		return chosen[: self.list_limit]
+		return chosen[:limit]
 
 	def decide(self, date: DateContext, observed: Profile, stated_ideal: Profile) -> Decision:
 		partner = date.partner
@@ -161,7 +164,7 @@ class Player1(BasePlayer):
 
 		eligible = self._eligible(partner, relaxed, endgame)
 		willing = date.round - self.proposed_to_me.get(partner, -100) <= WILLING_ROUNDS
-		best_other = self._best_other(partner, relaxed, endgame)
+		best_other = self._best_other(partner, relaxed, endgame, date.round)
 
 		if endgame:
 			want = eligible and score > floor
@@ -216,6 +219,7 @@ class Player1(BasePlayer):
 		else:
 			theirs = self._typical_their_cost()
 		score = self.bonus - mine - theirs / 2
+		self.partner_scores[partner] = self.bonus - theirs - mine / 2
 
 		shown = max(
 			self.bonus
@@ -305,8 +309,8 @@ class Player1(BasePlayer):
 	def _unresponsive(self, partner: int) -> bool:
 		return self.ignored.get(partner, 0) >= MAX_IGNORED
 
-	def _best_other(self, partner: int, relaxed: bool, endgame: bool) -> float:
-		"""Best score among other people we've dated who still look available."""
+	def _best_other(self, partner: int, relaxed: bool, endgame: bool, round_number: int) -> float:
+		"""Best score among available alternatives with a reason to accept."""
 		scores = [
 			score
 			for i, (score, _) in self.scores.items()
@@ -315,6 +319,10 @@ class Player1(BasePlayer):
 			and i not in self.blocked
 			and not self._unresponsive(i)
 			and self._eligible(i, relaxed, endgame)
+			and (
+				self.partner_scores[i] > 0
+				or round_number - self.proposed_to_me.get(i, -100) <= WILLING_ROUNDS
+			)
 		]
 		return max(scores, default=float('-inf'))
 
