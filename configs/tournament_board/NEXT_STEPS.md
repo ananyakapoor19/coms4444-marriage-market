@@ -10,13 +10,19 @@ Saved so we can resume without re-deriving the plan.
 - GCP auth works for `ak5447@columbia.edu` / project **`amlc-486700`**.
 - Existing VMs (TERMINATED): `socks-eval-2`, `socks-eval-6` (`n2-highcpu-16`, `us-east4-a`).
 
-## Friday: begin here
+## Status (started Fri Nov 13)
+Running on **2× `n2-highcpu-16`** (project CPU quota = 32; could not create more):
+- `socks-eval-2` → shard **0/2** → `~/marriage-market/logs/tournament_shard0.log`
+- `socks-eval-6` → shard **1/2** → `~/marriage-market/logs/tournament_shard1.log`
+
+Check progress:
+```bash
+gcloud compute ssh socks-eval-2 --zone=us-east4-a --tunnel-through-iap --command='tr "\r" "\n" < ~/marriage-market/logs/tournament_shard0.log | tail -3; wc -l ~/marriage-market/results/tournament_board/checkpoint_shard0of2.jsonl'
+```
 
 ### 1. Create / start VMs
 Recommended: **4–6 × `n2-highcpu-16`** in `us-east4-a` (reuse the two socks-eval boxes + create 2–4 new).
-Do **not** use GPUs.
-
-Suggested names: `marriage-eval-0` … `marriage-eval-N` (or restart `socks-eval-*` and add new).
+Do **not** use GPUs. Org policy: **no external IPs**; use IAP. Global CPU quota may block extra VMs.
 
 ### 2. Sync code onto each VM
 - Clone/pull `coms4444-marriage-market` at the commit with `tools/tournament_board.py`.
